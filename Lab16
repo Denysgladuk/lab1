@@ -1,0 +1,155 @@
+# ===============================================
+# Лабораторна робота №16
+# Ансамбль класифікаторів з modAL, Cleanlab та scikit-learn
+# ===============================================
+
+!pip uninstall -y modAL numpy
+!pip install --upgrade numpy scikit-learn modAL cleanlab matplotlib seaborn pandas==2.2.2 tqdm --quiet
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from modAL.models import ActiveLearner, Committee
+from cleanlab.classification import CleanLearning
+from cleanlab.filter import find_label_issues
+
+# =========================================================
+# 1. Підготовка даних
+# =========================================================
+
+data = load_iris()
+X = data.data
+y = data.target
+
+X_train_full, X_temp, y_train_full, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# =========================================================
+# 2. Налаштування базового ансамблю
+# =========================================================
+
+clf1 = RandomForestClassifier(n_estimators=50, random_state=0)
+clf2 = SVC(probability=True, kernel='linear', random_state=0)
+clf3 = KNeighborsClassifier(n_neighbors=5)
+
+learner_list = [
+    ActiveLearner(estimator=clf1, X_training=X_train_full[:10], y_training=y_train_full[:10]),
+    ActiveLearner(estimator=clf2, X_training=X_train_full[:10], y_training=y_train_full[:10]),
+    ActiveLearner(estimator=clf3, X_training=X_train_full[:10], y_training=y_train_full[:10])
+]
+
+committee = Committee(learner_list=learner_list)
+
+# =========================================================
+# 3. Цикл активного навчання
+# =========================================================
+
+X_labeled = X_train_full[:10]
+y_labeled = y_train_full[:10]
+X_unlabeled = X_train_full[10:]
+y_unlabeled = y_train_full[10:]
+budget = 50
+val_acc = []
+
+for i in tqdm(range(budget)):
+    query_idx, query_inst = committee.query(X_unlabeled)
+    new_X, new_y = X_unlabeled[query_idx], y_unlabeled[query_idx]
+    committee.teach(new_X, new_y)
+    X_labeled = np.append(X_labeled, new_X, axis=0)
+    y_labeled = np.append(y_labeled, new_y, axis=0)
+    X_unlabeled = np.delete(X_unlabeled, query_idx, axis=0)
+    y_unlabeled = np.delete(y_unlabeled, query_idx, axis=0)
+    preds = committee.predict(X_val)
+    val_acc.append(accuracy_score(y_val, preds))
+
+plt.figure(figsize=(8,5))
+plt.plot(range(1, budget+1), val_acc, marker='o')
+plt.title("Зміна точності на валідаційній вибірці під час активного навчання")
+plt.xlabel("Ітерація")
+plt.ylabel("Accuracy")
+plt.grid()
+plt.show()
+
+# =========================================================
+# 4. Використання Cleanlab
+# =========================================================
+
+issues = find_label_issues(labels=y_labeled, pred_probs=committee.predict_proba(X_labeled))
+print(f"Виявлено проблемних міток: {sum(issues)}")
+
+cl = CleanLearning(clf=RandomForestClassifier(n_estimators=100, random_state=0))
+cl.fit(X_labeled, y_labeled)
+clean_preds = cl.predict(X_test)
+clean_acc = accuracy_score(y_test, clean_preds)
+print(f"Точність після Cleanlab: {clean_acc:.3f}")
+
+# =========================================================
+# 5. Формування власного ансамблю
+# =========================================================
+
+base_learners = [
+    ('dt', DecisionTreeClassifier(max_depth=4, random_state=0)),
+    ('svc', SVC(kernel='linear', probability=True, random_state=0)),
+    ('lr', LogisticRegression(max_iter=1000, random_state=0))
+]
+
+meta_clf = RandomForestClassifier(n_estimators=100, random_state=0)
+stack = StackingClassifier(estimators=base_learners, final_estimator=meta_clf)
+
+param_grid = {
+    'final_estimator__n_estimators': [50, 100],
+    'final_estimator__max_depth': [None, 5, 10]
+}
+grid = GridSearchCV(stack, param_grid, cv=3)
+grid.fit(X_train_full, y_train_full)
+best_stack = grid.best_estimator_
+
+base_preds = committee.predict(X_test)
+stack_preds = best_stack.predict(X_test)
+
+base_acc = accuracy_score(y_test, base_preds)
+stack_acc = accuracy_score(y_test, stack_preds)
+
+print(f"Базовий ансамбль: {base_acc:.3f}")
+print(f"Custom ансамбль (Stacking): {stack_acc:.3f}")
+
+# =========================================================
+# 6. Порівняння результатів
+# =========================================================
+
+results = pd.DataFrame({
+    'Модель': ['Базовий ансамбль', 'Після Cleanlab', 'Custom Stacking'],
+    'Точність': [base_acc, clean_acc, stack_acc]
+})
+print(results)
+
+plt.figure(figsize=(6,4))
+sns.barplot(x='Модель', y='Точність', data=results, palette='viridis')
+plt.title("Порівняння точності моделей")
+plt.ylim(0.7, 1.0)
+plt.show()
+
+# =========================================================
+# 7. Візуалізація ансамблю
+# =========================================================
+
+dt = base_learners[0][1]
+dt.fit(X_train_full, y_train_full)
+plt.figure(figsize=(12,8))
+plot_tree(dt, feature_names=data.feature_names, class_names=data.target_names, filled=True)
+plt.show()
+
+importances = dt.feature_importances_
+sns.barplot(x=data.feature_names, y=importances, palette='mako')
+plt.title("Важливість ознак у дереві рішень")
+plt.show()
